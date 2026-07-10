@@ -28,14 +28,17 @@ class S3Operations(object):
             "S3 File Settings",
             "S3 File Settings",
         )
-        if (
-            self.s3_settings_doc.aws_key and
-            self.s3_settings_doc.aws_secret
-        ):
+        aws_key = self.s3_settings_doc.get_password(
+            "aws_key", raise_exception=False
+        )
+        aws_secret = self.s3_settings_doc.get_password(
+            "aws_secret", raise_exception=False
+        )
+        if aws_key and aws_secret:
             self.S3_CLIENT = boto3.client(
                 's3',
-                aws_access_key_id=self.s3_settings_doc.aws_key,
-                aws_secret_access_key=self.s3_settings_doc.aws_secret,
+                aws_access_key_id=aws_key,
+                aws_secret_access_key=aws_secret,
                 region_name=self.s3_settings_doc.region_name,
                 config=Config(signature_version='s3v4')
             )

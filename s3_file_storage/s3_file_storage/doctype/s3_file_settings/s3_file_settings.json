@@ -46,12 +46,12 @@
   },
   {
    "fieldname": "aws_key",
-   "fieldtype": "Data",
+   "fieldtype": "Password",
    "label": "AWS Key"
   },
   {
    "fieldname": "aws_secret",
-   "fieldtype": "Data",
+   "fieldtype": "Password",
    "label": "AWS Secret"
   },
   {
@@ -115,7 +115,7 @@
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2026-01-22 11:33:36.326361",
+ "modified": "2026-07-10 10:00:00.000000",
  "modified_by": "Administrator",
  "module": "S3 File Storage",
  "name": "S3 File Settings",
