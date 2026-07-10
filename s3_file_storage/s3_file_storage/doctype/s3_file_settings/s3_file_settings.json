@@ -1,0 +1,139 @@
+{
+ "actions": [],
+ "creation": "2025-08-28 13:20:28.290345",
+ "description": "This Doctype is used to configure file storage in an S3 bucket. Public file uploads are accessible if the bucket has public access enabled and the user has the required role. For private file uploads, access can be provided in two ways: either through direct download or via a pre-signed URL for secure viewing.",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "general_configuration",
+  "delete_file_from_cloud",
+  "aws_credentials",
+  "bucket_name",
+  "aws_key",
+  "aws_secret",
+  "section_break_7",
+  "region_name",
+  "folder_name",
+  "download_file_without_signed_url",
+  "signed_url_expiry_time",
+  "section_break_10",
+  "migrate_existing_files",
+  "doctype_configuration_section",
+  "ignore_mapped_doctypes",
+  "s3_doctype_mapping"
+ ],
+ "fields": [
+  {
+   "fieldname": "general_configuration",
+   "fieldtype": "Section Break",
+   "label": "General Configuration"
+  },
+  {
+   "default": "0",
+   "fieldname": "delete_file_from_cloud",
+   "fieldtype": "Check",
+   "label": "Delete file from cloud "
+  },
+  {
+   "fieldname": "aws_credentials",
+   "fieldtype": "Section Break",
+   "label": "AWS credentials"
+  },
+  {
+   "fieldname": "bucket_name",
+   "fieldtype": "Data",
+   "label": "Bucket Name"
+  },
+  {
+   "fieldname": "aws_key",
+   "fieldtype": "Data",
+   "label": "AWS Key"
+  },
+  {
+   "fieldname": "aws_secret",
+   "fieldtype": "Data",
+   "label": "AWS Secret"
+  },
+  {
+   "fieldname": "section_break_7",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "region_name",
+   "fieldtype": "Data",
+   "label": "S3 Bucket Region Name"
+  },
+  {
+   "fieldname": "folder_name",
+   "fieldtype": "Data",
+   "label": "Folder Name"
+  },
+  {
+   "default": "300",
+   "depends_on": "eval: !doc.download_file_without_signed_url",
+   "description": "time should be in seconds",
+   "fieldname": "signed_url_expiry_time",
+   "fieldtype": "Int",
+   "label": "Signed URL expiry time"
+  },
+  {
+   "fieldname": "section_break_10",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "migrate_existing_files",
+   "fieldtype": "Button",
+   "label": "Migrate Existing Files"
+  },
+  {
+   "default": "0",
+   "description": "This option works if file is uploaded as private",
+   "fieldname": "download_file_without_signed_url",
+   "fieldtype": "Check",
+   "label": "Download File without Signed URL"
+  },
+  {
+   "fieldname": "doctype_configuration_section",
+   "fieldtype": "Section Break",
+   "label": "Doctype Configuration"
+  },
+  {
+   "fieldname": "s3_doctype_mapping",
+   "fieldtype": "Table",
+   "label": "S3 Doctype Mapping",
+   "options": "S3 Doctype Mapping"
+  },
+  {
+   "default": "1",
+   "description": "If this checkbox is checked, the doctypes listed in the table below will be excluded from S3 uploads. If unchecked, only these doctypes will be included for S3 uploads.",
+   "fieldname": "ignore_mapped_doctypes",
+   "fieldtype": "Check",
+   "label": "Ignore Mapped Doctypes"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-01-22 11:33:36.326361",
+ "modified_by": "Administrator",
+ "module": "S3 File Storage",
+ "name": "S3 File Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
