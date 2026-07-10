@@ -81,7 +81,7 @@ class S3Operations(object):
                     f"Please check your S3 bucket settings. <br>Error: {error_message}"
                 ))
             else:
-                frappe.throw(frappe._("File Upload Failed. Please try again."))
+                frappe.throw(frappe._(f"File Upload Failed. Please try again. <br>Error: {error_message}"))
 
         return key
     
