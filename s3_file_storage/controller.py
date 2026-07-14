@@ -214,14 +214,28 @@ class S3Operations(object):
 
 
 @frappe.whitelist()
-def file_upload_to_s3(doc, method):
-    """Check and upload files to S3, then update File and parent records."""
+def file_upload_to_s3(doc, method, s3_key_cache=None):
+    """Check and upload files to S3, then update File and parent records.
+
+    `s3_key_cache` is an optional dict shared across calls (used during
+    bulk migration) that maps a physical file's dedup key — (content_hash,
+    is_private), falling back to file_url — to its already-uploaded S3 key.
+    Duplicate File records pointing at the same physical file reuse the
+    cached key instead of re-uploading, since the local file may already
+    have been removed by the first record's processing.
+    """
     if not doc or not doc.file_url:
         return
 
     if s3_file_regex_match(doc.file_url):
         return
-    
+
+    # Scope by is_private too: Frappe's own dedup (File.save_file /
+    # validate_duplicate_entry) never matches a public and a private file
+    # against each other even if their content_hash is identical, since
+    # they live on disk in separate directories with different ACL needs.
+    dedup_key = (doc.content_hash, doc.is_private) if doc.content_hash else doc.file_url
+
     s3_upload = S3Operations()
     parent_doctype = doc.attached_to_doctype or "File"
     parent_name = doc.attached_to_name
@@ -246,13 +260,19 @@ def file_upload_to_s3(doc, method):
         doc.file_name, parent_doctype, parent_name
     )
 
-    key = s3_upload.upload_files_to_s3_with_key(
-        file_path,
-        doc.file_name,
-        doc.is_private,
-        parent_doctype,
-        parent_name,
-    )
+    cached_key = s3_key_cache.get(dedup_key) if s3_key_cache is not None else None
+    if cached_key:
+        key = cached_key
+    else:
+        key = s3_upload.upload_files_to_s3_with_key(
+            file_path,
+            doc.file_name,
+            doc.is_private,
+            parent_doctype,
+            parent_name,
+        )
+        if s3_key_cache is not None:
+            s3_key_cache[dedup_key] = key
 
     # Build S3 file URL
     if doc.is_private:
@@ -292,6 +312,8 @@ def file_upload_to_s3(doc, method):
         os.remove(file_path)
 
     frappe.db.commit()
+
+    return doc.file_url
 
 
 @frappe.whitelist()
@@ -334,7 +356,7 @@ def upload_existing_files_s3(name):
     """
     try:
         doc = frappe.get_doc("File", name)
-        file_upload_to_s3(doc, None)
+        return file_upload_to_s3(doc, None, s3_key_cache)
     except frappe.DoesNotExistError:
         return
 
@@ -361,12 +383,17 @@ def migrate_existing_files():
     )
 
     total_files = len(files_list)
+    s3_key_cache = {}
+    url_map = {}
 
     for idx, file in enumerate(files_list, 1):
-        if file['file_url']:
-            if not s3_file_regex_match(file['file_url']):
-                upload_existing_files_s3(file['name'])
-                
+        old_url = file['file_url']
+        if old_url:
+            if not s3_file_regex_match(old_url):
+                new_url = upload_existing_files_s3(file['name'], s3_key_cache)
+                if new_url and new_url != old_url:
+                    url_map[old_url] = new_url
+
         frappe.publish_realtime(
             "file_migration_progress",
             {
@@ -375,8 +402,74 @@ def migrate_existing_files():
                 "progress": (idx * 100) / total_files
             },
         )
-        
+
+    if url_map:
+        frappe.enqueue(
+            "s3_file_storage.controller.update_attach_fields_after_migration",
+            queue="long",
+            timeout=6000,
+            url_map=url_map,
+        )
+
     return True
+
+
+def get_attach_fields():
+    """All (doctype, fieldname) pairs for Attach / Attach Image fields,
+    across standard doctypes (including child tables) and Custom Fields.
+    """
+    standard_fields = frappe.get_all(
+        "DocField",
+        filters={"fieldtype": ["in", ["Attach", "Attach Image"]]},
+        fields=["parent as doctype", "fieldname"],
+    )
+    custom_fields = frappe.get_all(
+        "Custom Field",
+        filters={"fieldtype": ["in", ["Attach", "Attach Image"]]},
+        fields=["dt as doctype", "fieldname"],
+    )
+    return [(d.doctype, d.fieldname) for d in standard_fields + custom_fields]
+
+
+def update_attach_fields_after_migration(url_map):
+    """Background job: fix Attach/Attach Image values left pointing at the
+    pre-migration local file path.
+    """
+    if not url_map:
+        return
+
+    old_urls = list(url_map.keys())
+
+    for doctype, fieldname in get_attach_fields():
+        meta = frappe.get_meta(doctype)
+        if not meta.istable:
+            continue
+        if not frappe.db.has_column(doctype, fieldname):
+            continue
+
+        try:
+            rows = frappe.db.sql(
+                f"""SELECT `name`, `{fieldname}` AS value
+                    FROM `tab{doctype}`
+                    WHERE `{fieldname}` IN %(urls)s""",
+                {"urls": old_urls},
+                as_dict=True,
+            )
+        except Exception:
+            frappe.log_error(
+                title="S3 migration: attach field scan failed",
+                message=frappe.get_traceback(),
+            )
+            continue
+
+        for row in rows:
+            new_url = url_map.get(row.value)
+            if new_url:
+                frappe.db.set_value(
+                    doctype, row.name, fieldname, new_url, update_modified=False
+                )
+
+    frappe.db.commit()
 
 
 def delete_from_cloud(doc, method):
