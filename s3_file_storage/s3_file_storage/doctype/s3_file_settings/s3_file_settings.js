@@ -52,7 +52,6 @@ frappe.ui.form.on("S3 File Settings", {
                                 message: __("{0} file(s) migrated to S3", [result.migrated]),
                                 indicator: "green"
                             });
-                            location.reload(true);
                         }
                     }
                 });
