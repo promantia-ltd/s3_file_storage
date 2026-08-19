@@ -13,8 +13,11 @@ from botocore.client import Config
 from botocore.exceptions import ClientError
 
 import frappe
+from frappe.utils import create_batch
 
-
+# Chunk size for the `IN (...)` lookups run during migration clean-up, so a
+# site with tens of thousands of files does not build one oversized query.
+URL_LOOKUP_BATCH_SIZE = 500
 
 
 class S3Operations(object):
@@ -213,7 +216,6 @@ class S3Operations(object):
         return url
 
 
-@frappe.whitelist()
 def file_upload_to_s3(doc, method, s3_key_cache=None):
     """Check and upload files to S3, then update File and parent records.
 
@@ -229,6 +231,10 @@ def file_upload_to_s3(doc, method, s3_key_cache=None):
 
     if s3_file_regex_match(doc.file_url):
         return
+
+    # Remember the local path before it is overwritten below: parent fields
+    # are only repointed where they still hold this exact value.
+    old_file_url = doc.file_url
 
     # Scope by is_private too: Frappe's own dedup (File.save_file /
     # validate_duplicate_entry) never matches a public and a private file
@@ -295,25 +301,104 @@ def file_upload_to_s3(doc, method, s3_key_cache=None):
         update_modified=False,
     )
 
-    # Update image field if exists
+    # Repoint the parent document at the new URL
     if parent_doctype and parent_name:
-        meta = frappe.get_meta(parent_doctype)
-        image_field = meta.get("image_field")
-        if image_field:
-            frappe.db.set_value(parent_doctype, parent_name, image_field, doc.file_url, update_modified=False)
+        parent_meta = frappe.get_meta(parent_doctype)
 
-        # Update attached field if applicable
-        attached_field = doc.get("attached_to_field")
-        if not method and attached_field and frappe.db.has_column(parent_doctype, attached_field):
-            frappe.db.set_value(parent_doctype, parent_name, attached_field, doc.file_url, update_modified=False)
-    
+        image_field = parent_meta.get("image_field")
+        if image_field:
+            replace_file_url(parent_meta, parent_name, image_field, old_file_url, doc.file_url)
+
+        # On a normal upload the browser writes the returned S3 URL into the
+        # field itself, so only migration (method=None) has to do it here —
+        # including fields that live on child table rows or Single doctypes.
+        if not method:
+            update_attached_to_field(doc, parent_meta, parent_name, old_file_url)
+
     # Remove local file
     if os.path.exists(file_path):
         os.remove(file_path)
 
-    frappe.db.commit()
-
     return doc.file_url
+
+
+def update_attached_to_field(doc, parent_meta, parent_name, old_url):
+    """Repoint the Attach field this file was uploaded into. Used by
+    migration, where nothing else will write the new URL back.
+
+    When the Attach field sits inside a child table, Frappe still records the
+    *parent* doctype and name on the File record, while `attached_to_field`
+    names a field on the child doctype. The parent therefore has no such
+    column, and the child row has to be found by the URL it still holds.
+    """
+    fieldname = doc.get("attached_to_field")
+    if not fieldname:
+        return
+
+    if parent_meta.has_field(fieldname):
+        replace_file_url(parent_meta, parent_name, fieldname, old_url, doc.file_url)
+        return
+
+    for table_field in parent_meta.get_table_fields():
+        child_doctype = table_field.options
+        if not frappe.get_meta(child_doctype).has_field(fieldname):
+            continue
+
+        rows = frappe.get_all(
+            child_doctype,
+            filters={
+                "parent": parent_name,
+                "parenttype": parent_meta.name,
+                fieldname: old_url,
+            },
+            pluck="name",
+        )
+        for row in rows:
+            frappe.db.set_value(
+                child_doctype, row, fieldname, doc.file_url, update_modified=False
+            )
+
+
+def replace_file_url(meta, name, fieldname, old_url, new_url):
+    """Point `fieldname` at the S3 URL, but only where it still holds the old
+    local path — so attaching an unrelated file never overwrites a field that
+    points at a different one.
+    """
+    if meta.issingle:
+        if frappe.db.get_single_value(meta.name, fieldname) == old_url:
+            frappe.db.set_single_value(meta.name, fieldname, new_url)
+        return
+
+    if not frappe.db.has_column(meta.name, fieldname):
+        return
+
+    if frappe.db.get_value(meta.name, name, fieldname) == old_url:
+        frappe.db.set_value(meta.name, name, fieldname, new_url, update_modified=False)
+
+
+def validate_file_access(key):
+    """Allow the download only if the session user may read a File record that
+    points at this S3 key.
+
+    The key is stored in `File.content_hash` by `file_upload_to_s3`, so the
+    File record is the bridge back to the attached document. Frappe's own
+    `File.is_downloadable()` walks up to `attached_to_doctype` /
+    `attached_to_name` and applies that document's read permission.
+
+    Several File records can share one key (duplicate uploads reuse the same
+    S3 object), so access to any one of them is enough. An unknown key is
+    refused outright — otherwise the endpoint would read arbitrary objects
+    out of the bucket.
+    """
+    if frappe.session.user == "Guest":
+        raise frappe.PermissionError
+
+    names = frappe.get_all("File", filters={"content_hash": key}, pluck="name")
+    for name in names:
+        if frappe.get_doc("File", name).is_downloadable():
+            return
+
+    raise frappe.PermissionError
 
 
 @frappe.whitelist()
@@ -322,6 +407,7 @@ def generate_file(key=None, file_name=None):
     Function to download file from s3.
     """
     if key:
+        validate_file_access(key)
         s3_upload = S3Operations()
         if s3_upload.s3_settings_doc.get("download_file_without_signed_url"):
             file_data = s3_upload.read_file_from_s3(key)
@@ -350,23 +436,27 @@ def generate_file(key=None, file_name=None):
     return
 
 
-def upload_existing_files_s3(name):
+def upload_existing_files_s3(name, s3_key_cache=None):
     """
-    Function to upload all existing files.
+    Function to upload a single existing file, reusing the caller's dedup
+    cache so duplicate File records share one S3 object.
     """
     try:
         doc = frappe.get_doc("File", name)
-        return file_upload_to_s3(doc, None, s3_key_cache)
     except frappe.DoesNotExistError:
         return
+
+    return file_upload_to_s3(doc, None, s3_key_cache)
 
 
 def s3_file_regex_match(file_url):
     """
-    Match the public file regex match.
+    True if the URL already points at S3 — either a public bucket URL or the
+    private-download endpoint of this app. Used to skip files that have
+    already been migrated.
     """
     return re.match(
-        r'^(https:|/api/method/frappe_s3_attachment.controller.generate_file)',
+        r'^(https:|/api/method/s3_file_storage\.controller\.generate_file)',
         file_url
     )
 
@@ -376,6 +466,7 @@ def migrate_existing_files():
     """
     Function to migrate the existing files to s3.
     """
+    frappe.only_for("System Manager")
 
     files_list = frappe.get_all(
         'File',
@@ -385,14 +476,28 @@ def migrate_existing_files():
     total_files = len(files_list)
     s3_key_cache = {}
     url_map = {}
+    failed = 0
 
     for idx, file in enumerate(files_list, 1):
         old_url = file['file_url']
-        if old_url:
-            if not s3_file_regex_match(old_url):
+        if old_url and not s3_file_regex_match(old_url):
+            # One unreadable or already-deleted file must not abort a run that
+            # may span thousands of records; log it and carry on.
+            try:
                 new_url = upload_existing_files_s3(file['name'], s3_key_cache)
                 if new_url and new_url != old_url:
                     url_map[old_url] = new_url
+                # Commit per file. The local copy is already deleted by this
+                # point, so a rollback later in the run would leave the file
+                # gone from disk with the record still pointing at it.
+                frappe.db.commit()
+            except Exception:
+                failed += 1
+                frappe.db.rollback()
+                frappe.log_error(
+                    title=f"S3 migration failed for File {file['name']}",
+                    message=frappe.get_traceback(),
+                )
 
         frappe.publish_realtime(
             "file_migration_progress",
@@ -411,7 +516,7 @@ def migrate_existing_files():
             url_map=url_map,
         )
 
-    return True
+    return {"migrated": len(url_map), "failed": failed, "total": total_files}
 
 
 def get_attach_fields():
@@ -434,6 +539,9 @@ def get_attach_fields():
 def update_attach_fields_after_migration(url_map):
     """Background job: fix Attach/Attach Image values left pointing at the
     pre-migration local file path.
+
+    Covers ordinary doctypes, child tables and Single doctypes — every place
+    an Attach field can hold a file URL.
     """
     if not url_map:
         return
@@ -441,26 +549,45 @@ def update_attach_fields_after_migration(url_map):
     old_urls = list(url_map.keys())
 
     for doctype, fieldname in get_attach_fields():
-        meta = frappe.get_meta(doctype)
-        if not meta.istable:
-            continue
-        if not frappe.db.has_column(doctype, fieldname):
+        try:
+            meta = frappe.get_meta(doctype)
+        except Exception:
+            # Doctype belongs to an app that is no longer installed.
             continue
 
+        if meta.issingle:
+            update_single_attach_field(doctype, fieldname, url_map)
+            continue
+
+        try:
+            if not frappe.db.has_column(doctype, fieldname):
+                continue
+        except Exception:
+            # Table missing — nothing to scan.
+            continue
+
+        update_attach_field(doctype, fieldname, old_urls, url_map)
+
+    frappe.db.commit()
+
+
+def update_attach_field(doctype, fieldname, old_urls, url_map):
+    """Repoint one Attach field on one table-backed doctype."""
+    for batch in create_batch(old_urls, URL_LOOKUP_BATCH_SIZE):
         try:
             rows = frappe.db.sql(
                 f"""SELECT `name`, `{fieldname}` AS value
                     FROM `tab{doctype}`
                     WHERE `{fieldname}` IN %(urls)s""",
-                {"urls": old_urls},
+                {"urls": tuple(batch)},
                 as_dict=True,
             )
         except Exception:
             frappe.log_error(
-                title="S3 migration: attach field scan failed",
+                title=f"S3 migration: attach field scan failed ({doctype}.{fieldname})",
                 message=frappe.get_traceback(),
             )
-            continue
+            return
 
         for row in rows:
             new_url = url_map.get(row.value)
@@ -469,7 +596,14 @@ def update_attach_fields_after_migration(url_map):
                     doctype, row.name, fieldname, new_url, update_modified=False
                 )
 
-    frappe.db.commit()
+
+def update_single_attach_field(doctype, fieldname, url_map):
+    """Repoint one Attach field on a Single doctype, whose value lives in
+    `tabSingles` rather than a column of its own.
+    """
+    new_url = url_map.get(frappe.db.get_single_value(doctype, fieldname))
+    if new_url:
+        frappe.db.set_single_value(doctype, fieldname, new_url)
 
 
 def delete_from_cloud(doc, method):

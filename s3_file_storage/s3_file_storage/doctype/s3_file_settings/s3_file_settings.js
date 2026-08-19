@@ -29,17 +29,30 @@ frappe.ui.form.on("S3 File Settings", {
                 frappe.call({
                     method: "s3_file_storage.controller.migrate_existing_files",
                     callback: function (data) {
-                        if (data.message) {
-                            frappe.show_alert({
-                                message: __("S3 File Upload Successful"),
-                                indicator: "green"
-                            });
-                            location.reload(true);
-                        } else {
+                        let result = data.message;
+                        if (!result) {
                             frappe.show_alert({
                                 message: __("Retry"),
                                 indicator: "red"
                             });
+                            return;
+                        }
+
+                        if (result.failed) {
+                            frappe.msgprint({
+                                title: __("Migration Finished with Errors"),
+                                message: __(
+                                    "{0} file(s) migrated, {1} failed. See the Error Log for details.",
+                                    [result.migrated, result.failed]
+                                ),
+                                indicator: "orange"
+                            });
+                        } else {
+                            frappe.show_alert({
+                                message: __("{0} file(s) migrated to S3", [result.migrated]),
+                                indicator: "green"
+                            });
+                            location.reload(true);
                         }
                     }
                 });

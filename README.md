@@ -5,17 +5,17 @@ This app helps you store files from Frappe into an S3 bucket easily and securely
 
 ## Generating Custom File Name and Path Structure for S3
 
-This guide explains how to use the **`s3_key_generator` hook** in a custom Frappe/ERPNext app to define your own **file name and folder path structure** when uploading files to Amazon S3.
+This guide explains how to use the **`build_s3_object_key` hook** in a custom Frappe/ERPNext app to define your own **file name and folder path structure** when uploading files to Amazon S3.
 
 ---
 
-## 📌 Why Use `s3_key_generator`?
+## 📌 Why Use `build_s3_object_key`?
 By default, file paths in S3 are auto-generated. However, in some cases, you may want to:
 - Organize files under specific folders per **Doctype** or **record**.
 - Generate file names dynamically (e.g., timestamp-based, UUID-based, or Doctype-based).
 - Implement custom naming conventions for better file management.
 
-The `s3_key_generator` hook gives you full control over **how file paths are structured**.
+The `build_s3_object_key` hook gives you full control over **how file paths are structured**.
 
 ---
 
@@ -23,7 +23,7 @@ The `s3_key_generator` hook gives you full control over **how file paths are str
 When a file is uploaded, the S3 storage handler looks for the hook:
 
 ```python
-hook_cmd = frappe.get_hooks().get("s3_key_generator")
+hook_cmd = frappe.get_hooks().get("build_s3_object_key")
 if hook_cmd:
     try:
         k = frappe.get_attr(hook_cmd[0])(
@@ -34,7 +34,7 @@ if hook_cmd:
             parent_name=parent_name
         )
         if k:
-            return k.rstrip('/').lstrip('/')
+            return k
     except:
         pass
 ```
@@ -50,7 +50,7 @@ In your custom app, add the following entry inside `hooks.py`:
 
 ```python
 # hooks.py
-s3_key_generator = ["my_app.s3_utils.custom_s3_key"]
+build_s3_object_key = ["my_app.s3_utils.custom_s3_key"]
 ```
 
 ---
@@ -119,15 +119,32 @@ When a file is uploaded in Frappe, the above hook will be triggered and the file
 ---
 
 ## 🚨 Notes
-- Your custom function **must return a string** (the S3 key).
-- The system automatically ensures no leading/trailing `/`.
-- If the hook fails or is not defined, the **default key generator** will be used.
+- Your custom function **must return a string** (the S3 key) with no leading or trailing `/`.
+- If the hook raises or returns a falsy value, the **default key generator** is used instead.
 - You can log/debug your function with `frappe.logger()`.
 
 ---
 
+## 🏷️ Customising Only the File Name
+
+If the folder structure is fine and you only want to change how the **file name** is cleaned up, use the `file_name_generator` hook instead:
+
+```python
+# hooks.py
+file_name_generator = ["my_app.s3_utils.custom_file_name"]
+```
+
+```python
+def custom_file_name(file_name=None, parent_doctype=None, parent_name=None):
+    return f"{parent_name}-{file_name}"
+```
+
+The default behaviour replaces spaces with `_` and strips anything outside `0-9 a-z A-Z . _ -`.
+
+---
+
 ## 📖 Summary
-By using the `s3_key_generator` hook, you can **fully customize how files are organized in S3**.  
+By using the `build_s3_object_key` hook, you can **fully customize how files are organized in S3**.  
 This helps in better structuring, easier search, and avoids conflicts in naming.
 
 ---
