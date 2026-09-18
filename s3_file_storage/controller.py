@@ -18,6 +18,16 @@ import frappe
 from frappe.utils import create_batch
 
 URL_LOOKUP_BATCH_SIZE = 500
+LOGGER_NAME = "s3_file_storage"
+SUMMARY_SAMPLE_SIZE = 50
+
+SKIP_REASONS = {
+    "already_on_s3": "already stored on S3",
+    "doctype_excluded": "excluded by the S3 Doctype Mapping table",
+    "missing_local_file": "local file missing on disk",
+    "no_file_url": "no file attached",
+    "file_not_found": "File record no longer exists",
+}
 
 
 class S3Operations(object):
@@ -176,10 +186,10 @@ class S3Operations(object):
 
 def file_upload_to_s3(doc, method, s3_key_cache=None):
     if not doc or not doc.file_url or doc.get("is_folder"):
-        return
+        return set_skip_reason(doc, "no_file_url")
 
     if s3_file_regex_match(doc.file_url):
-        return doc.file_url
+        return set_skip_reason(doc, "already_on_s3")
 
     old_file_url = doc.file_url
     dedup_key = (doc.content_hash, doc.is_private) if doc.content_hash else doc.file_url
@@ -187,20 +197,15 @@ def file_upload_to_s3(doc, method, s3_key_cache=None):
     s3_upload = S3Operations()
     parent_doctype = doc.attached_to_doctype or "File"
     parent_name = doc.attached_to_name
-    ignore_mapped_doctypes = bool(s3_upload.s3_settings_doc.get("ignore_mapped_doctypes"))
-    mapped_doctypes = {
-        d.mapped_doctype
-        for d in s3_upload.s3_settings_doc.get("s3_doctype_mapping", [])
-    }
 
-    if (parent_doctype in mapped_doctypes) == ignore_mapped_doctypes:
-        return doc.file_url
+    if is_doctype_excluded(s3_upload.s3_settings_doc, parent_doctype):
+        return set_skip_reason(doc, "doctype_excluded")
 
     file_path = get_local_file_path(doc)
     cached_key = s3_key_cache.get(dedup_key) if s3_key_cache is not None else None
 
     if not cached_key and not os.path.exists(file_path):
-        return doc.file_url
+        return set_skip_reason(doc, "missing_local_file")
 
     doc.file_name = s3_upload.file_name_generator(
         doc.file_name or os.path.basename(old_file_url),
@@ -254,6 +259,45 @@ def file_upload_to_s3(doc, method, s3_key_cache=None):
         os.remove(file_path)
 
     return doc.file_url
+
+
+def set_skip_reason(doc, reason):
+    if not doc:
+        return
+
+    doc.flags.s3_skip_reason = reason
+    log_skipped_file(doc.name, doc.file_url, reason)
+
+    return doc.file_url
+
+
+def log_skipped_file(name, file_url, reason):
+    """Record why a file did not reach S3, in sites/<site>/logs/s3_file_storage.log."""
+    if reason == "already_on_s3":
+        return
+
+    frappe.logger(LOGGER_NAME).info(
+        f"Skipped File {name} ({file_url}): {SKIP_REASONS.get(reason, reason)}"
+    )
+
+
+def is_doctype_excluded(settings_doc, parent_doctype):
+    """Decide whether the mapping table keeps this doctype out of S3.
+
+    The mapping table is a blacklist when `ignore_mapped_doctypes` is checked and a
+    whitelist when it is not. An empty table means "no restriction" in both modes,
+    so an unsaved/unconfigured setting never silently blocks every upload.
+    """
+    mapped_doctypes = {
+        d.mapped_doctype
+        for d in settings_doc.get("s3_doctype_mapping", [])
+    }
+    if not mapped_doctypes:
+        return False
+
+    return (parent_doctype in mapped_doctypes) == bool(
+        settings_doc.get("ignore_mapped_doctypes")
+    )
 
 
 def get_local_file_path(doc):
@@ -351,12 +395,15 @@ def generate_file(key=None, file_name=None):
 
 
 def upload_existing_files_s3(name, s3_key_cache=None):
+    """Migrate one File. Returns (new_file_url, skip_reason)."""
     try:
         doc = frappe.get_doc("File", name)
     except frappe.DoesNotExistError:
-        return
+        return None, "file_not_found"
 
-    return file_upload_to_s3(doc, None, s3_key_cache)
+    file_url = file_upload_to_s3(doc, None, s3_key_cache)
+
+    return file_url, doc.flags.get("s3_skip_reason")
 
 
 def s3_file_regex_match(file_url):
@@ -382,19 +429,33 @@ def migrate_existing_files():
     total_files = len(files_list)
     s3_key_cache = {}
     url_map = {}
-    failed = 0
+    skipped_files = []
+    failed_files = []
+
+    frappe.logger(LOGGER_NAME).info(f"S3 migration started for {total_files} file(s)")
 
     for idx, file in enumerate(files_list, 1):
         old_url = file['file_url']
-        if old_url and not s3_file_regex_match(old_url):
+        if not old_url or s3_file_regex_match(old_url):
+            reason = "already_on_s3" if old_url else "no_file_url"
+            log_skipped_file(file['name'], old_url, reason)
+            skipped_files.append({"name": file['name'], "file_url": old_url, "reason": reason})
+        else:
             try:
-                new_url = upload_existing_files_s3(file['name'], s3_key_cache)
-                if new_url and new_url != old_url:
+                new_url, skip_reason = upload_existing_files_s3(file['name'], s3_key_cache)
+                if skip_reason:
+                    skipped_files.append(
+                        {"name": file['name'], "file_url": old_url, "reason": skip_reason}
+                    )
+                elif new_url and new_url != old_url:
                     url_map[old_url] = new_url
                 frappe.db.commit()
             except Exception:
-                failed += 1
                 frappe.db.rollback()
+                failed_files.append({"name": file['name'], "file_url": old_url})
+                frappe.logger(LOGGER_NAME).error(
+                    f"Failed File {file['name']} ({old_url})", exc_info=True
+                )
                 frappe.log_error(
                     title=f"S3 migration failed for File {file['name']}",
                     message=frappe.get_traceback(),
@@ -417,7 +478,52 @@ def migrate_existing_files():
             url_map=url_map,
         )
 
-    return {"migrated": len(url_map), "failed": failed, "total": total_files}
+    skipped = {}
+    for file in skipped_files:
+        skipped[file["reason"]] = skipped.get(file["reason"], 0) + 1
+
+    log_migration_summary(total_files, len(url_map), skipped_files, failed_files)
+
+    return {
+        "migrated": len(url_map),
+        "failed": len(failed_files),
+        "total": total_files,
+        "skipped": skipped,
+    }
+
+
+def log_migration_summary(total_files, migrated, skipped_files, failed_files):
+    """Write one Error Log entry naming the files that were skipped or failed."""
+    summary = (
+        f"Total: {total_files}, migrated: {migrated}, "
+        f"skipped: {len(skipped_files)}, failed: {len(failed_files)}"
+    )
+    frappe.logger(LOGGER_NAME).info(f"S3 migration finished. {summary}")
+
+    reported = [file for file in skipped_files if file["reason"] != "already_on_s3"]
+    if not reported and not failed_files:
+        return
+
+    lines = [summary]
+
+    for reason in {file["reason"] for file in reported}:
+        names = [file["name"] for file in reported if file["reason"] == reason]
+        lines.append(f"\nSkipped ({SKIP_REASONS.get(reason, reason)}): {len(names)}")
+        lines.append(format_file_sample(names))
+
+    if failed_files:
+        lines.append(f"\nFailed: {len(failed_files)} (see the per-file Error Log entries)")
+        lines.append(format_file_sample([file["name"] for file in failed_files]))
+
+    frappe.log_error(title="S3 migration summary", message="\n".join(lines))
+
+
+def format_file_sample(names):
+    sample = ", ".join(names[:SUMMARY_SAMPLE_SIZE])
+    if len(names) > SUMMARY_SAMPLE_SIZE:
+        sample += f", ... and {len(names) - SUMMARY_SAMPLE_SIZE} more"
+
+    return sample
 
 
 def get_attach_fields():
