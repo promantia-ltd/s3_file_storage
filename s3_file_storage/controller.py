@@ -1,22 +1,26 @@
+# --- Imports ---
 from __future__ import unicode_literals
 
 import datetime
+import mimetypes
 import os
 import random
 import re
 import string
+from collections import Counter
 from urllib.parse import urlencode
 
 import boto3
 import magic
-import mimetypes
-
 from botocore.client import Config
 from botocore.exceptions import ClientError
 
 import frappe
+from frappe import _
 from frappe.utils import create_batch
 
+
+# --- Constants ---
 URL_LOOKUP_BATCH_SIZE = 500
 LOGGER_NAME = "s3_file_storage"
 SUMMARY_SAMPLE_SIZE = 50
@@ -30,161 +34,9 @@ SKIP_REASONS = {
 }
 
 
-class S3Operations(object):
-
-    def __init__(self):
-        self.s3_settings_doc = frappe.get_doc(
-            "S3 File Settings",
-            "S3 File Settings",
-        )
-        aws_key = self.s3_settings_doc.get_password(
-            "aws_key", raise_exception=False
-        )
-        aws_secret = self.s3_settings_doc.get_password(
-            "aws_secret", raise_exception=False
-        )
-        if aws_key and aws_secret:
-            self.S3_CLIENT = boto3.client(
-                's3',
-                aws_access_key_id=aws_key,
-                aws_secret_access_key=aws_secret,
-                region_name=self.s3_settings_doc.region_name,
-                config=Config(signature_version='s3v4')
-            )
-        else:
-            self.S3_CLIENT = boto3.client(
-                's3',
-                region_name=self.s3_settings_doc.region_name,
-                config=Config(signature_version='s3v4')
-            )
-        self.BUCKET = self.s3_settings_doc.bucket_name
-        self.folder_name = self.s3_settings_doc.folder_name
-
-    def upload_files_to_s3_with_key(
-        self, file_path, file_name, is_private, parent_doctype, parent_name
-    ):
-        mime_type = magic.from_file(file_path, mime=True)
-        key = self.key_generator(file_name, file_path, parent_doctype, parent_name)
-        content_type = mime_type
-        try:
-            extra_args = {
-                "ContentType": content_type,
-                "Metadata": {
-                    "ContentType": content_type,
-                    "file_name": file_name
-                }
-            }
-
-            if not is_private:
-                extra_args["ACL"] = 'public-read'
-
-            self.S3_CLIENT.upload_file(file_path, self.BUCKET, key, ExtraArgs=extra_args)
-
-        except boto3.exceptions.S3UploadFailedError as e:
-            error_message = str(e)
-            if re.search(r'accessdenied|blockpublicacls', error_message, re.IGNORECASE):
-                frappe.throw(frappe._(
-                    "File Upload Failed because you don't have permission to upload public files. "
-                    f"Please check your S3 bucket settings. <br>Error: {error_message}"
-                ))
-            else:
-                frappe.throw(frappe._(f"File Upload Failed. Please try again. <br>Error: {error_message}"))
-
-        return key
-
-    def key_generator(self, file_name, file_path, parent_doctype, parent_name):
-        hook_cmd = frappe.get_hooks().get("build_s3_object_key")
-        if hook_cmd:
-            try:
-                k = frappe.get_attr(hook_cmd[0])(
-                    self.folder_name,
-                    file_path=file_path,
-                    file_name=file_name,
-                    parent_doctype=parent_doctype,
-                    parent_name=parent_name
-                )
-                if k:
-                    return k
-            except Exception:
-                pass
-
-        key = ''.join(
-            random.choice(
-                string.ascii_uppercase + string.digits) for _ in range(8)
-        )
-
-        today = datetime.datetime.now()
-        year = today.strftime("%Y")
-        month = today.strftime("%m")
-        day = today.strftime("%d")
-
-        parts = [year, month, day, parent_doctype, key + "_" + file_name]
-        if self.folder_name:
-            parts.insert(0, self.folder_name)
-
-        return "/".join(parts)
-
-    def file_name_generator(self, file_name, parent_doctype, parent_name):
-        hook_cmd = frappe.get_hooks().get("file_name_generator")
-        if hook_cmd:
-            try:
-                k = frappe.get_attr(hook_cmd[0])(
-                    file_name=file_name,
-                    parent_doctype=parent_doctype,
-                    parent_name=parent_name
-                )
-                if k:
-                    return k
-            except Exception:
-                pass
-
-        file_name = file_name.replace(' ', '_')
-        file_name = self.strip_special_chars(file_name)
-
-        return file_name
-
-    def strip_special_chars(self, file_name):
-        regex = re.compile('[^0-9a-zA-Z._-]')
-        file_name = regex.sub('', file_name)
-        return file_name
-
-    def delete_from_s3(self, key):
-        if self.s3_settings_doc.delete_file_from_cloud:
-            try:
-                self.S3_CLIENT.delete_object(
-                    Bucket=self.s3_settings_doc.bucket_name,
-                    Key=key
-                )
-            except ClientError:
-                frappe.throw(frappe._("Access denied: Could not delete file"))
-
-    def read_file_from_s3(self, key):
-        obj = self.S3_CLIENT.get_object(Bucket=self.BUCKET, Key=key)
-        file_data = obj["Body"].read()
-
-        return file_data
-
-    def get_url(self, key, file_name=None):
-        if self.s3_settings_doc.signed_url_expiry_time:
-            self.signed_url_expiry_time = self.s3_settings_doc.signed_url_expiry_time
-        else:
-            self.signed_url_expiry_time = 120
-
-        params = {'Bucket': self.BUCKET, 'Key': key, }
-
-        if file_name:
-            params['ResponseContentDisposition'] = 'filename={}'.format(file_name)
-
-        url = self.S3_CLIENT.generate_presigned_url(
-            'get_object',
-            Params=params,
-            ExpiresIn=self.signed_url_expiry_time,
-        )
-
-        return url
-
-
-def file_upload_to_s3(doc, method, s3_key_cache=None):
+# --- Controllers ---
+def file_upload_to_s3(doc, method):
+    """File.after_insert — push the attached file to S3 and repoint every field at it."""
     if not doc or not doc.file_url or doc.get("is_folder"):
         return set_skip_reason(doc, "no_file_url")
 
@@ -192,7 +44,6 @@ def file_upload_to_s3(doc, method, s3_key_cache=None):
         return set_skip_reason(doc, "already_on_s3")
 
     old_file_url = doc.file_url
-    dedup_key = (doc.content_hash, doc.is_private) if doc.content_hash else doc.file_url
 
     s3_upload = S3Operations()
     parent_doctype = doc.attached_to_doctype or "File"
@@ -202,9 +53,8 @@ def file_upload_to_s3(doc, method, s3_key_cache=None):
         return set_skip_reason(doc, "doctype_excluded")
 
     file_path = get_local_file_path(doc)
-    cached_key = s3_key_cache.get(dedup_key) if s3_key_cache is not None else None
 
-    if not cached_key and not os.path.exists(file_path):
+    if not os.path.exists(file_path):
         return set_skip_reason(doc, "missing_local_file")
 
     doc.file_name = s3_upload.file_name_generator(
@@ -213,24 +63,15 @@ def file_upload_to_s3(doc, method, s3_key_cache=None):
         parent_name,
     )
 
-    if cached_key:
-        key = cached_key
-    else:
-        key = s3_upload.upload_files_to_s3_with_key(
-            file_path,
-            doc.file_name,
-            doc.is_private,
-            parent_doctype,
-            parent_name,
-        )
-        if s3_key_cache is not None:
-            s3_key_cache[dedup_key] = key
+    key = s3_upload.upload_files_to_s3_with_key(
+        file_path,
+        doc.file_name,
+        doc.is_private,
+        parent_doctype,
+        parent_name,
+    )
 
-    if doc.is_private:
-        query = urlencode({"key": key, "file_name": doc.file_name})
-        doc.file_url = f"/api/method/s3_file_storage.controller.generate_file?{query}"
-    else:
-        doc.file_url = f"{s3_upload.S3_CLIENT.meta.endpoint_url}/{s3_upload.BUCKET}/{key}"
+    doc.file_url = build_file_url(s3_upload, key, doc.file_name, doc.is_private)
 
     frappe.db.set_value(
         "File",
@@ -255,10 +96,37 @@ def file_upload_to_s3(doc, method, s3_key_cache=None):
         if not method:
             update_attached_to_field(doc, parent_meta, parent_name, old_file_url)
 
-    if os.path.exists(file_path):
-        os.remove(file_path)
+    delete_local_file(file_path, old_file_url, doc.name)
 
     return doc.file_url
+
+
+def delete_from_cloud(doc, method):
+    """File.on_change — drop the S3 object when the record that owns it is deleted."""
+    if not doc.flags.in_delete or not doc.content_hash:
+        return
+
+    if not s3_file_regex_match(doc.file_url):
+        return
+
+    # A custom build_s3_object_key hook can map several records onto one object;
+    # drop it only with the last record that still references it.
+    if frappe.db.exists("File", {"content_hash": doc.content_hash, "name": ("!=", doc.name)}):
+        return
+
+    S3Operations().delete_from_s3(doc.content_hash)
+
+
+# --- File Upload To S3 Helpers ---
+def s3_file_regex_match(file_url):
+    """Tell an S3-backed URL (direct link or private download endpoint) from a local path."""
+    if not file_url:
+        return None
+
+    return re.match(
+        r"^(https:|/api/method/s3_file_storage\.controller\.generate_file)",
+        file_url,
+    )
 
 
 def set_skip_reason(doc, reason):
@@ -309,6 +177,15 @@ def get_local_file_path(doc):
     return f"{site_path}/public{doc.file_url}"
 
 
+def build_file_url(s3_upload, key, file_name, is_private):
+    """A private file is served through the site so permissions still apply."""
+    if is_private:
+        query = urlencode({"key": key, "file_name": file_name})
+        return f"/api/method/s3_file_storage.controller.generate_file?{query}"
+
+    return f"{s3_upload.S3_CLIENT.meta.endpoint_url}/{s3_upload.BUCKET}/{key}"
+
+
 def update_attached_to_field(doc, parent_meta, parent_name, old_url):
     fieldname = doc.get("attached_to_field")
     if not fieldname:
@@ -318,6 +195,8 @@ def update_attached_to_field(doc, parent_meta, parent_name, old_url):
         replace_file_url(parent_meta, parent_name, fieldname, old_url, doc.file_url)
         return
 
+    # The field lives on a child row: Frappe only records the parent on the File, so
+    # the old path is the only way back to the row that holds it.
     for table_field in parent_meta.get_table_fields():
         child_doctype = table_field.options
         if not frappe.get_meta(child_doctype).has_field(fieldname):
@@ -339,6 +218,7 @@ def update_attached_to_field(doc, parent_meta, parent_name, old_url):
 
 
 def replace_file_url(meta, name, fieldname, old_url, new_url):
+    """Repoint a field only when it still holds this file, never another one."""
     if meta.issingle:
         if frappe.db.get_single_value(meta.name, fieldname) == old_url:
             frappe.db.set_single_value(meta.name, fieldname, new_url)
@@ -351,7 +231,101 @@ def replace_file_url(meta, name, fieldname, old_url, new_url):
         frappe.db.set_value(meta.name, name, fieldname, new_url, update_modified=False)
 
 
+def delete_local_file(file_path, file_url, name):
+    """Drop the on-disk copy once no other File record still points at it.
+
+    Frappe stores one copy per unique content, so several File records can share one
+    path. Whichever of them migrates last is the one that finds no sibling left on the
+    old URL and removes the file. If a sibling was skipped (excluded doctype, failure),
+    the file stays and that record keeps working.
+    """
+    if not os.path.exists(file_path):
+        return
+
+    if frappe.db.exists("File", {"file_url": file_url, "name": ("!=", name)}):
+        return
+
+    os.remove(file_path)
+
+
+# --- Whitelisted Methods ---
+@frappe.whitelist()
+def generate_file(key=None, file_name=None):
+    """Serve a private S3 file to a user allowed to read the File record."""
+    if not key:
+        frappe.local.response["body"] = "Key not found."
+        return
+
+    validate_file_access(key)
+    s3_upload = S3Operations()
+
+    if s3_upload.s3_settings_doc.get("download_file_without_signed_url"):
+        stream_file_from_s3(s3_upload, key, file_name)
+        return
+
+    frappe.local.response["type"] = "redirect"
+    frappe.local.response["location"] = s3_upload.get_url(key, file_name)
+
+
+@frappe.whitelist()
+def migrate_existing_files():
+    """Push every file still on local disk to S3, one record at a time."""
+    frappe.only_for("System Manager")
+
+    files_list = frappe.get_all(
+        "File",
+        filters={"is_folder": 0},
+        fields=["name", "file_url"],
+    )
+
+    total_files = len(files_list)
+    url_map = {}
+    skipped_files = []
+    failed_files = []
+
+    frappe.logger(LOGGER_NAME).info(f"S3 migration started for {total_files} file(s)")
+
+    for idx, file in enumerate(files_list, 1):
+        old_url = file["file_url"]
+        new_url, skip_reason, failed = migrate_one_file(file["name"], old_url)
+
+        if failed:
+            failed_files.append(file)
+        elif skip_reason:
+            skipped_files.append({**file, "reason": skip_reason})
+        elif new_url and new_url != old_url:
+            url_map[old_url] = new_url
+
+        publish_migration_progress(idx, total_files)
+
+    if url_map:
+        frappe.enqueue(
+            "s3_file_storage.controller.update_attach_fields_after_migration",
+            queue="long",
+            timeout=6000,
+            url_map=url_map,
+        )
+
+    log_migration_summary(total_files, len(url_map), skipped_files, failed_files)
+
+    frappe.db.commit()
+
+    return {
+        "migrated": len(url_map),
+        "failed": len(failed_files),
+        "total": total_files,
+        "skipped": dict(Counter(file["reason"] for file in skipped_files)),
+    }
+
+
+@frappe.whitelist()
+def ping():
+    return "pong"
+
+
+# --- Generate File Helpers ---
 def validate_file_access(key):
+    """Allow the download only if the user can read one of the records holding this key."""
     if frappe.session.user == "Guest":
         raise frappe.PermissionError
 
@@ -363,133 +337,144 @@ def validate_file_access(key):
     raise frappe.PermissionError
 
 
-@frappe.whitelist()
-def generate_file(key=None, file_name=None):
-    if not key:
-        frappe.local.response['body'] = "Key not found."
-        return
+def stream_file_from_s3(s3_upload, key, file_name):
+    """Send the bytes through the site instead of handing out a signed S3 URL."""
+    file_data = s3_upload.read_file_from_s3(key)
 
-    validate_file_access(key)
-    s3_upload = S3Operations()
+    if not isinstance(file_data, (bytes, bytearray)):
+        file_data = bytes(file_data, "utf-8")
 
-    if s3_upload.s3_settings_doc.get("download_file_without_signed_url"):
-        file_data = s3_upload.read_file_from_s3(key)
+    mimetype = mimetypes.guess_type(file_name or key)[0] or "application/octet-stream"
 
-        if not isinstance(file_data, (bytes, bytearray)):
-            file_data = bytes(file_data, "utf-8")
-
-        guessed_mimetype, _ = mimetypes.guess_type(file_name or key)
-        mimetype = guessed_mimetype or "application/octet-stream"
-
-        frappe.local.response.filename = file_name or key.split("/")[-1]
-        frappe.local.response.type = "download"
-        frappe.local.response.filecontent = file_data
-        frappe.local.response["Content-Type"] = mimetype
-        frappe.local.response["Content-Disposition"] = (
-            f'attachment; filename="{frappe.local.response.filename}"'
-        )
-    else:
-        signed_url = s3_upload.get_url(key, file_name)
-        frappe.local.response["type"] = "redirect"
-        frappe.local.response["location"] = signed_url
+    frappe.local.response.filename = file_name or key.split("/")[-1]
+    frappe.local.response.type = "download"
+    frappe.local.response.filecontent = file_data
+    frappe.local.response["Content-Type"] = mimetype
+    frappe.local.response["Content-Disposition"] = (
+        f'attachment; filename="{frappe.local.response.filename}"'
+    )
 
 
-def upload_existing_files_s3(name, s3_key_cache=None):
+# --- Migrate Existing Files Helpers ---
+def migrate_one_file(name, old_url):
+    """Migrate one File in its own transaction. Returns (new_url, skip_reason, failed)."""
+    if not old_url or s3_file_regex_match(old_url):
+        reason = "already_on_s3" if old_url else "no_file_url"
+        log_skipped_file(name, old_url, reason)
+        return None, reason, False
+
+    try:
+        new_url, skip_reason = upload_existing_file_to_s3(name)
+        frappe.db.commit()
+        return new_url, skip_reason, False
+    except Exception:
+        frappe.db.rollback()
+        log_failed_file(name, old_url)
+        return None, None, True
+
+
+def upload_existing_file_to_s3(name):
     """Migrate one File. Returns (new_file_url, skip_reason)."""
     try:
         doc = frappe.get_doc("File", name)
     except frappe.DoesNotExistError:
         return None, "file_not_found"
 
-    file_url = file_upload_to_s3(doc, None, s3_key_cache)
+    file_url = file_upload_to_s3(doc, None)
 
     return file_url, doc.flags.get("s3_skip_reason")
 
 
-def s3_file_regex_match(file_url):
-    if not file_url:
-        return None
-
-    return re.match(
-        r'^(https:|/api/method/s3_file_storage\.controller\.generate_file)',
-        file_url
+def log_failed_file(name, file_url):
+    frappe.logger(LOGGER_NAME).error(f"Failed File {name} ({file_url})", exc_info=True)
+    frappe.log_error(
+        title=f"S3 migration failed for File {name}",
+        message=frappe.get_traceback(),
     )
 
 
-@frappe.whitelist()
-def migrate_existing_files():
-    frappe.only_for("System Manager")
-
-    files_list = frappe.get_all(
-        'File',
-        filters={"is_folder": 0},
-        fields=['name', 'file_url']
+def publish_migration_progress(current_file, total_files):
+    frappe.publish_realtime(
+        "file_migration_progress",
+        {
+            "current_file": current_file,
+            "total_files": total_files,
+            "progress": (current_file * 100) / total_files,
+        },
     )
 
-    total_files = len(files_list)
-    s3_key_cache = {}
-    url_map = {}
-    skipped_files = []
-    failed_files = []
 
-    frappe.logger(LOGGER_NAME).info(f"S3 migration started for {total_files} file(s)")
+def update_attach_fields_after_migration(url_map):
+    """Repoint Attach fields left holding a local path. Enqueued once the loop is done."""
+    if not url_map:
+        return
 
-    for idx, file in enumerate(files_list, 1):
-        old_url = file['file_url']
-        if not old_url or s3_file_regex_match(old_url):
-            reason = "already_on_s3" if old_url else "no_file_url"
-            log_skipped_file(file['name'], old_url, reason)
-            skipped_files.append({"name": file['name'], "file_url": old_url, "reason": reason})
-        else:
-            try:
-                new_url, skip_reason = upload_existing_files_s3(file['name'], s3_key_cache)
-                if skip_reason:
-                    skipped_files.append(
-                        {"name": file['name'], "file_url": old_url, "reason": skip_reason}
-                    )
-                elif new_url and new_url != old_url:
-                    url_map[old_url] = new_url
-                frappe.db.commit()
-            except Exception:
-                frappe.db.rollback()
-                failed_files.append({"name": file['name'], "file_url": old_url})
-                frappe.logger(LOGGER_NAME).error(
-                    f"Failed File {file['name']} ({old_url})", exc_info=True
+    old_urls = list(url_map.keys())
+
+    for doctype, fieldname in get_attach_fields():
+        try:
+            meta = frappe.get_meta(doctype)
+        except Exception:
+            continue
+
+        if meta.issingle:
+            update_single_attach_field(doctype, fieldname, url_map)
+            continue
+
+        try:
+            if not frappe.db.has_column(doctype, fieldname):
+                continue
+        except Exception:
+            continue
+
+        update_attach_field(doctype, fieldname, old_urls, url_map)
+
+    frappe.db.commit()
+
+
+def get_attach_fields():
+    standard_fields = frappe.get_all(
+        "DocField",
+        filters={"fieldtype": ["in", ["Attach", "Attach Image"]]},
+        fields=["parent as doctype", "fieldname"],
+    )
+    custom_fields = frappe.get_all(
+        "Custom Field",
+        filters={"fieldtype": ["in", ["Attach", "Attach Image"]]},
+        fields=["dt as doctype", "fieldname"],
+    )
+    return [(d.doctype, d.fieldname) for d in standard_fields + custom_fields]
+
+
+def update_attach_field(doctype, fieldname, old_urls, url_map):
+    for batch in create_batch(old_urls, URL_LOOKUP_BATCH_SIZE):
+        try:
+            rows = frappe.db.sql(
+                f"""SELECT `name`, `{fieldname}` AS value
+                    FROM `tab{doctype}`
+                    WHERE `{fieldname}` IN %(urls)s""",
+                {"urls": tuple(batch)},
+                as_dict=True,
+            )
+        except Exception:
+            frappe.log_error(
+                title=f"S3 migration: attach field scan failed ({doctype}.{fieldname})",
+                message=frappe.get_traceback(),
+            )
+            return
+
+        for row in rows:
+            new_url = url_map.get(row.value)
+            if new_url:
+                frappe.db.set_value(
+                    doctype, row.name, fieldname, new_url, update_modified=False
                 )
-                frappe.log_error(
-                    title=f"S3 migration failed for File {file['name']}",
-                    message=frappe.get_traceback(),
-                )
 
-        frappe.publish_realtime(
-            "file_migration_progress",
-            {
-                "current_file": idx,
-                "total_files": total_files,
-                "progress": (idx * 100) / total_files
-            },
-        )
 
-    if url_map:
-        frappe.enqueue(
-            "s3_file_storage.controller.update_attach_fields_after_migration",
-            queue="long",
-            timeout=6000,
-            url_map=url_map,
-        )
-
-    skipped = {}
-    for file in skipped_files:
-        skipped[file["reason"]] = skipped.get(file["reason"], 0) + 1
-
-    log_migration_summary(total_files, len(url_map), skipped_files, failed_files)
-
-    return {
-        "migrated": len(url_map),
-        "failed": len(failed_files),
-        "total": total_files,
-        "skipped": skipped,
-    }
+def update_single_attach_field(doctype, fieldname, url_map):
+    new_url = url_map.get(frappe.db.get_single_value(doctype, fieldname))
+    if new_url:
+        frappe.db.set_single_value(doctype, fieldname, new_url)
 
 
 def log_migration_summary(total_files, migrated, skipped_files, failed_files):
@@ -526,88 +511,163 @@ def format_file_sample(names):
     return sample
 
 
-def get_attach_fields():
-    standard_fields = frappe.get_all(
-        "DocField",
-        filters={"fieldtype": ["in", ["Attach", "Attach Image"]]},
-        fields=["parent as doctype", "fieldname"],
-    )
-    custom_fields = frappe.get_all(
-        "Custom Field",
-        filters={"fieldtype": ["in", ["Attach", "Attach Image"]]},
-        fields=["dt as doctype", "fieldname"],
-    )
-    return [(d.doctype, d.fieldname) for d in standard_fields + custom_fields]
+# --- S3 Operations ---
+class S3Operations(object):
 
-
-def update_attach_fields_after_migration(url_map):
-    if not url_map:
-        return
-
-    old_urls = list(url_map.keys())
-
-    for doctype, fieldname in get_attach_fields():
-        try:
-            meta = frappe.get_meta(doctype)
-        except Exception:
-            continue
-
-        if meta.issingle:
-            update_single_attach_field(doctype, fieldname, url_map)
-            continue
-
-        try:
-            if not frappe.db.has_column(doctype, fieldname):
-                continue
-        except Exception:
-            continue
-
-        update_attach_field(doctype, fieldname, old_urls, url_map)
-
-    frappe.db.commit()
-
-
-def update_attach_field(doctype, fieldname, old_urls, url_map):
-    for batch in create_batch(old_urls, URL_LOOKUP_BATCH_SIZE):
-        try:
-            rows = frappe.db.sql(
-                f"""SELECT `name`, `{fieldname}` AS value
-                    FROM `tab{doctype}`
-                    WHERE `{fieldname}` IN %(urls)s""",
-                {"urls": tuple(batch)},
-                as_dict=True,
+    def __init__(self):
+        self.s3_settings_doc = frappe.get_doc(
+            "S3 File Settings",
+            "S3 File Settings",
+        )
+        aws_key = self.s3_settings_doc.get_password(
+            "aws_key", raise_exception=False
+        )
+        aws_secret = self.s3_settings_doc.get_password(
+            "aws_secret", raise_exception=False
+        )
+        if aws_key and aws_secret:
+            self.S3_CLIENT = boto3.client(
+                "s3",
+                aws_access_key_id=aws_key,
+                aws_secret_access_key=aws_secret,
+                region_name=self.s3_settings_doc.region_name,
+                config=Config(signature_version="s3v4"),
             )
-        except Exception:
-            frappe.log_error(
-                title=f"S3 migration: attach field scan failed ({doctype}.{fieldname})",
-                message=frappe.get_traceback(),
+        else:
+            self.S3_CLIENT = boto3.client(
+                "s3",
+                region_name=self.s3_settings_doc.region_name,
+                config=Config(signature_version="s3v4"),
             )
-            return
+        self.BUCKET = self.s3_settings_doc.bucket_name
+        self.folder_name = self.s3_settings_doc.folder_name
 
-        for row in rows:
-            new_url = url_map.get(row.value)
-            if new_url:
-                frappe.db.set_value(
-                    doctype, row.name, fieldname, new_url, update_modified=False
+    def file_name_generator(self, file_name, parent_doctype, parent_name):
+        hook_cmd = frappe.get_hooks().get("file_name_generator")
+        if hook_cmd:
+            try:
+                k = frappe.get_attr(hook_cmd[0])(
+                    file_name=file_name,
+                    parent_doctype=parent_doctype,
+                    parent_name=parent_name,
+                )
+                if k:
+                    return k
+            except Exception:
+                pass
+
+        file_name = file_name.replace(" ", "_")
+        file_name = self.strip_special_chars(file_name)
+
+        return file_name
+
+    def strip_special_chars(self, file_name):
+        regex = re.compile("[^0-9a-zA-Z._-]")
+        file_name = regex.sub("", file_name)
+        return file_name
+
+    def upload_files_to_s3_with_key(
+        self, file_path, file_name, is_private, parent_doctype, parent_name
+    ):
+        mime_type = magic.from_file(file_path, mime=True)
+        key = self.key_generator(file_name, file_path, parent_doctype, parent_name)
+        content_type = mime_type
+        try:
+            extra_args = {
+                "ContentType": content_type,
+                "Metadata": {
+                    "ContentType": content_type,
+                    "file_name": file_name,
+                },
+            }
+
+            if not is_private:
+                extra_args["ACL"] = "public-read"
+
+            self.S3_CLIENT.upload_file(file_path, self.BUCKET, key, ExtraArgs=extra_args)
+
+        except boto3.exceptions.S3UploadFailedError as e:
+            error_message = str(e)
+            if re.search(r"accessdenied|blockpublicacls", error_message, re.IGNORECASE):
+                frappe.throw(
+                    _(
+                        "File Upload Failed because you don't have permission to upload "
+                        "public files. Please check your S3 bucket settings. <br>Error: {0}"
+                    ).format(error_message)
+                )
+            else:
+                frappe.throw(
+                    _("File Upload Failed. Please try again. <br>Error: {0}").format(
+                        error_message
+                    )
                 )
 
+        return key
 
-def update_single_attach_field(doctype, fieldname, url_map):
-    new_url = url_map.get(frappe.db.get_single_value(doctype, fieldname))
-    if new_url:
-        frappe.db.set_single_value(doctype, fieldname, new_url)
+    def key_generator(self, file_name, file_path, parent_doctype, parent_name):
+        hook_cmd = frappe.get_hooks().get("build_s3_object_key")
+        if hook_cmd:
+            try:
+                k = frappe.get_attr(hook_cmd[0])(
+                    self.folder_name,
+                    file_path=file_path,
+                    file_name=file_name,
+                    parent_doctype=parent_doctype,
+                    parent_name=parent_name,
+                )
+                if k:
+                    return k
+            except Exception:
+                pass
 
+        # The random prefix keeps two files of the same name from overwriting each other.
+        key = "".join(
+            random.choice(
+                string.ascii_uppercase + string.digits) for _ in range(8)
+        )
 
-def delete_from_cloud(doc, method):
-    if not doc.flags.in_delete or not doc.content_hash:
-        return
+        today = datetime.datetime.now()
+        year = today.strftime("%Y")
+        month = today.strftime("%m")
+        day = today.strftime("%d")
 
-    if not s3_file_regex_match(doc.file_url):
-        return
+        parts = [year, month, day, parent_doctype, key + "_" + file_name]
+        if self.folder_name:
+            parts.insert(0, self.folder_name)
 
-    S3Operations().delete_from_s3(doc.content_hash)
+        return "/".join(parts)
 
+    def get_url(self, key, file_name=None):
+        if self.s3_settings_doc.signed_url_expiry_time:
+            self.signed_url_expiry_time = self.s3_settings_doc.signed_url_expiry_time
+        else:
+            self.signed_url_expiry_time = 120
 
-@frappe.whitelist()
-def ping():
-    return "pong"
+        params = {"Bucket": self.BUCKET, "Key": key}
+
+        if file_name:
+            params["ResponseContentDisposition"] = "filename={}".format(file_name)
+
+        url = self.S3_CLIENT.generate_presigned_url(
+            "get_object",
+            Params=params,
+            ExpiresIn=self.signed_url_expiry_time,
+        )
+
+        return url
+
+    def read_file_from_s3(self, key):
+        obj = self.S3_CLIENT.get_object(Bucket=self.BUCKET, Key=key)
+        file_data = obj["Body"].read()
+
+        return file_data
+
+    def delete_from_s3(self, key):
+        if self.s3_settings_doc.delete_file_from_cloud:
+            try:
+                self.S3_CLIENT.delete_object(
+                    Bucket=self.s3_settings_doc.bucket_name,
+                    Key=key,
+                )
+            except ClientError:
+                frappe.throw(_("Access denied: Could not delete file"))

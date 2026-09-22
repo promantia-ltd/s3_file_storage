@@ -156,6 +156,8 @@ Only fields that still hold the file's old local path are touched, so attaching 
 
 > **Note on child tables:** when a file is attached to a field inside a grid row, Frappe records the **parent** document on the File record (e.g. `Sales Invoice` / `SINV-0001`), not the child row. On a normal upload the browser writes the new URL into the row itself. During **migration** there is no browser involved, so the app locates the correct row by the old path it still holds and updates it there — the same applies to fields on Settings (Single) pages.
 
+> **Note on duplicate files:** Frappe keeps only one copy on disk when the same file is attached more than once, so several File records can share one path. Each of those records is uploaded to its own object in S3, and the shared local copy is deleted only after the last record pointing at it has moved.
+
 **Two consequences to remember:**
 
 1. **`content_hash` is no longer a checksum** on S3-stored files. Don't use it for duplicate detection or integrity checks on those records, and never clear or edit it — the app cannot locate or delete the file in S3 without it.
@@ -287,7 +289,7 @@ Run this once, after you have configured and tested the settings. It finds files
    ```bash
    bench --site your-site backup --with-files
    ```
-   Migration deletes local files and cannot be undone.
+   Migration deletes local files and cannot be undone. A shared file is deleted only once every File record pointing at it has reached S3 — if one of them is excluded by your Doctype Configuration, the local copy stays.
 2. **Test on a staging copy of your site first.** Confirm a sample of documents still open correctly there.
 3. **Verify your settings** by attaching one test file and checking that it appears in the bucket.
 4. **Set your Doctype Configuration first** — migration respects the same include/exclude rules as normal uploads.
