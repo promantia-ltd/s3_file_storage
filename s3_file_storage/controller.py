@@ -31,6 +31,7 @@ SKIP_REASONS = {
     "missing_local_file": "local file missing on disk",
     "no_file_url": "no file attached",
     "file_not_found": "File record no longer exists",
+    "s3_upload_disabled": "S3 upload is disabled in S3 File Settings",
 }
 
 
@@ -46,6 +47,11 @@ def file_upload_to_s3(doc, method):
     old_file_url = doc.file_url
 
     s3_upload = S3Operations()
+    if not s3_upload.upload_enabled:
+        return set_skip_reason(doc, "s3_upload_disabled")
+
+    s3_upload.validate_site_name()
+
     parent_doctype = doc.attached_to_doctype or "File"
     parent_name = doc.attached_to_name
 
@@ -168,6 +174,11 @@ def is_doctype_excluded(settings_doc, parent_doctype):
     )
 
 
+def is_configured_site(settings_doc):
+    """True when these settings were saved for the site that is running now."""
+    return (settings_doc.site_name or "").strip() == frappe.local.site
+
+
 def get_local_file_path(doc):
     site_path = frappe.utils.get_site_path()
 
@@ -258,6 +269,7 @@ def generate_file(key=None, file_name=None):
 
     validate_file_access(key)
     s3_upload = S3Operations()
+    s3_upload.validate_bucket()
 
     if s3_upload.s3_settings_doc.get("download_file_without_signed_url"):
         stream_file_from_s3(s3_upload, key, file_name)
@@ -271,6 +283,7 @@ def generate_file(key=None, file_name=None):
 def migrate_existing_files():
     """Push every file still on local disk to S3, one record at a time."""
     frappe.only_for("System Manager")
+    S3Operations().validate_bucket()
 
     files_list = frappe.get_all(
         "File",
@@ -539,8 +552,34 @@ class S3Operations(object):
                 region_name=self.s3_settings_doc.region_name,
                 config=Config(signature_version="s3v4"),
             )
-        self.BUCKET = self.s3_settings_doc.bucket_name
+        self.upload_enabled = bool(self.s3_settings_doc.enable_s3_upload)
+        self.site_matches = is_configured_site(self.s3_settings_doc)
+        # A restored copy of another site must never read, write or delete in its bucket.
+        self.BUCKET = (
+            self.s3_settings_doc.bucket_name
+            if self.upload_enabled and self.site_matches
+            else ""
+        )
         self.folder_name = self.s3_settings_doc.folder_name
+
+    def validate_site_name(self):
+        """Block S3 work on a site other than the one these settings were made for."""
+        if not self.upload_enabled or self.site_matches:
+            return
+
+        frappe.throw(
+            _(
+                "The Site Name configured in S3 File Settings ({0}) does not match "
+                "the actual site name ({1}). Update S3 File Settings before uploading."
+            ).format(self.s3_settings_doc.site_name or _("not set"), frappe.local.site),
+            title=_("S3 Site Name Mismatch"),
+        )
+
+    def validate_bucket(self):
+        if not self.upload_enabled:
+            frappe.throw(_("S3 upload is disabled in S3 File Settings."))
+
+        self.validate_site_name()
 
     def file_name_generator(self, file_name, parent_doctype, parent_name):
         hook_cmd = frappe.get_hooks().get("file_name_generator")
@@ -663,10 +702,10 @@ class S3Operations(object):
         return file_data
 
     def delete_from_s3(self, key):
-        if self.s3_settings_doc.delete_file_from_cloud:
+        if self.BUCKET and self.s3_settings_doc.delete_file_from_cloud:
             try:
                 self.S3_CLIENT.delete_object(
-                    Bucket=self.s3_settings_doc.bucket_name,
+                    Bucket=self.BUCKET,
                     Key=key,
                 )
             except ClientError:

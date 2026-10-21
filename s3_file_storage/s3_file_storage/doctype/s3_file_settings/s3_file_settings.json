@@ -6,6 +6,9 @@
  "engine": "InnoDB",
  "field_order": [
   "general_configuration",
+  "enable_s3_upload",
+  "site_name",
+  "column_break_general",
   "delete_file_from_cloud",
   "aws_credentials",
   "bucket_name",
@@ -27,6 +30,25 @@
    "fieldname": "general_configuration",
    "fieldtype": "Section Break",
    "label": "General Configuration"
+  },
+  {
+   "default": "0",
+   "description": "When unchecked, new files stay on the local disk.",
+   "fieldname": "enable_s3_upload",
+   "fieldtype": "Check",
+   "label": "Enable S3 Upload"
+  },
+  {
+   "depends_on": "enable_s3_upload",
+   "mandatory_depends_on": "enable_s3_upload",
+   "description": "The site this configuration belongs to. The bucket is used only when this matches the current site, so a restored copy of this site (e.g. UAT) never writes to this bucket.",
+   "fieldname": "site_name",
+   "fieldtype": "Data",
+   "label": "Site Name"
+  },
+  {
+   "fieldname": "column_break_general",
+   "fieldtype": "Column Break"
   },
   {
    "default": "0",
@@ -115,7 +137,7 @@
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2026-07-10 10:00:00.000000",
+ "modified": "2026-10-21 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "S3 File Storage",
  "name": "S3 File Settings",

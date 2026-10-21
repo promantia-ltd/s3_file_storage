@@ -71,6 +71,8 @@ Open **S3 File Settings**. Only users with the **System Manager** role can view 
 
 | Field | What it does |
 |---|---|
+| **Enable S3 Upload** | Master switch. **Unchecked** — new files stay on the local disk, migration and private-file downloads are refused, and nothing is deleted from S3. **Checked** — the bucket below is used, provided Site Name matches. |
+| **Site Name** | The site these settings belong to, exactly as in `sites/` (e.g. `erp.example.com`). Required when S3 upload is enabled. If it does not match the running site — typically after restoring a production backup onto UAT — uploads are blocked with an error naming the actual site, and the bucket is never touched. |
 | **Delete file from cloud** | What happens on S3 when someone deletes an attachment in Frappe.<br>**Unchecked (default)** — the Frappe File record goes, the S3 object stays forever. Safer, but S3 storage keeps growing.<br>**Checked** — the S3 object is deleted too. Cleaner, but the file is gone for good. |
 
 > If you enable **Delete file from cloud**, enable S3 Versioning as well. Versioning means a deleted object can still be recovered by your cloud team.

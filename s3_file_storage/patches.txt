@@ -4,3 +4,4 @@
 
 [post_model_sync]
 # Patches added in this section will be executed after doctypes are migrated
+s3_file_storage.patches.enable_s3_upload_for_configured_sites
