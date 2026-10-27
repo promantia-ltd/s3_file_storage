@@ -15,10 +15,10 @@
   "aws_key",
   "aws_secret",
   "section_break_7",
-  "region_name",
-  "folder_name",
   "download_file_without_signed_url",
   "signed_url_expiry_time",
+  "region_name",
+  "folder_name",
   "section_break_10",
   "migrate_existing_files",
   "doctype_configuration_section",
@@ -40,11 +40,11 @@
   },
   {
    "depends_on": "enable_s3_upload",
-   "mandatory_depends_on": "enable_s3_upload",
    "description": "The site this configuration belongs to. The bucket is used only when this matches the current site, so a restored copy of this site (e.g. UAT) never writes to this bucket.",
    "fieldname": "site_name",
    "fieldtype": "Data",
-   "label": "Site Name"
+   "label": "Site Name",
+   "mandatory_depends_on": "enable_s3_upload"
   },
   {
    "fieldname": "column_break_general",
@@ -137,7 +137,7 @@
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2026-10-21 12:00:00.000000",
+ "modified": "2026-10-26 17:08:37.165254",
  "modified_by": "Administrator",
  "module": "S3 File Storage",
  "name": "S3 File Settings",

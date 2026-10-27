@@ -50,13 +50,13 @@ def file_upload_to_s3(doc, method):
     if not s3_upload.upload_enabled:
         return set_skip_reason(doc, "s3_upload_disabled")
 
-    s3_upload.validate_site_name()
-
     parent_doctype = doc.attached_to_doctype or "File"
     parent_name = doc.attached_to_name
 
     if is_doctype_excluded(s3_upload.s3_settings_doc, parent_doctype):
         return set_skip_reason(doc, "doctype_excluded")
+
+    s3_upload.validate_site_name()
 
     file_path = get_local_file_path(doc)
 
